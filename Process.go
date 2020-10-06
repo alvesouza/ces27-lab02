@@ -49,6 +49,7 @@ var id int
 type processStruct struct {
 	Id          int
 	Clock       int
+	Address     string
 	TypeMessage messageType
 	Texto       string
 }
@@ -74,6 +75,13 @@ func maxInt(a int, b int) int {
 	}
 	return b
 }
+
+func incClock(clockOther int) {
+	processInfoAux := <-processInfo
+	processInfoAux.Clock = maxInt(processInfoAux.Clock, clockOther) + 1
+	processInfo <- processInfoAux
+	fmt.Println("Clock: ", processInfoAux.Clock)
+}
 func doServerJob() {
 	var processInfoAux processStruct
 	var requestProcessesInfoAux []processStruct = make([]processStruct, 0)
@@ -91,30 +99,52 @@ func doServerJob() {
 		// processInfoReceived, erro := strconv.Atoi(string(buf[0:n]))
 		err = json.Unmarshal(buf[:n], &processInfoReceived)
 		CheckError(err)
+		if processInfoReceived.Id != 0 {
+			fmt.Printf("Received Clock = %d from Process %d and ip %s\n", processInfoReceived.Clock,
+				processInfoReceived.Id, addr)
+		}
 
-		fmt.Printf("Received %d from %s\n", processInfoReceived.Clock, addr)
-
-		processInfoAux = <-processInfo
 		//Aumenta 1 de clock para cada mensagem recebida
-		processInfoAux.Clock = maxInt(processInfoAux.Clock, processInfoReceived.Clock) + 1
+		//processInfoAux.Clock = maxInt(processInfoAux.Clock, processInfoReceived.Clock) + 1
+		incClock(processInfoReceived.Clock)
+		processInfoAux = <-processInfo
+		processInfo <- processInfoAux
+		//fmt.Println("Clock ", processInfoAux.Clock, " do processo ", processInfoAux.Id)
 		T := <-requestTimeStamp
 		requestTimeStamp <- T
-		message = processStruct{Id: processInfoAux.Id, Clock: processInfoAux.Clock, Texto: processInfoAux.Texto}
+		message = processStruct{Id: processInfoAux.Id, Clock: processInfoAux.Clock, Texto: processInfoAux.Texto,
+			Address: processInfoAux.Address}
 		//stateProcessAux = <- stateProcess
 		switch processInfoReceived.TypeMessage {
 		case REQUEST:
+			fmt.Println("Mensagem eh REQUEST")
 			switch <-stateProcess {
 			case WANTED:
 				//caso seja verdade nao entra em case HELD
-
-				if !(T < processInfoReceived.Clock || (T == processInfoReceived.Clock && processInfoAux.Id < processInfoReceived.Id)) {
+				fmt.Println("Process esta em WANTED")
+				if T < processInfoReceived.Clock ||
+					(T == processInfoReceived.Clock && processInfoAux.Id < processInfoReceived.Id) {
 					message.TypeMessage = REPLY
+					message.Clock = T
+					fmt.Println("T = ", T)
+					fmt.Println("Recebido (Tj, id) = (", processInfoReceived.Clock, ", ",
+						processInfoReceived.Id, ")")
 					go doClientJob(CliConn[processInfoReceived.Id-1], message)
-					stateProcess <- WANTED
-					break
+				} else {
+					fmt.Println("Recebido (Tj, id) = (", processInfoReceived.Clock, ", ",
+						processInfoReceived.Id, ")")
+					fmt.Println("É armazenado")
+					requestProcessesInfoAux = append(requestProcessesInfoAux, <-requestProcessesInfo...)
+					requestProcessesInfoAux = append(requestProcessesInfoAux, processInfoReceived)
+					requestProcessesInfo <- requestProcessesInfoAux
+					requestProcessesInfoAux = nil
 				}
 				stateProcess <- WANTED
+				break
 			case HELD:
+				fmt.Println("Process esta em HELD")
+				fmt.Println("Recebido (Tj, id) = (", processInfoReceived.Clock, ", ",
+					processInfoReceived.Id, ")")
 				requestProcessesInfoAux = append(requestProcessesInfoAux, <-requestProcessesInfo...)
 				requestProcessesInfoAux = append(requestProcessesInfoAux, processInfoReceived)
 				requestProcessesInfo <- requestProcessesInfoAux
@@ -122,6 +152,9 @@ func doServerJob() {
 				stateProcess <- HELD
 				break
 			case RELEASED:
+				fmt.Println("Process esta em RELEASED")
+				fmt.Println("Manda reply para o processo ", processInfoReceived.Id, " de Clock ",
+					processInfoReceived.Clock)
 				message.TypeMessage = REPLY
 				go doClientJob(CliConn[processInfoReceived.Id-1], message)
 				stateProcess <- RELEASED
@@ -130,25 +163,29 @@ func doServerJob() {
 			}
 			break
 		case REPLY:
+			fmt.Println("Mensagem eh REPLY")
 			state := <-stateProcess
+			fmt.Println("state ", state)
 			switch state {
 			case WANTED:
 				replies = <-numReplies + 1
-
+				fmt.Println("replies = ", replies-1)
 				if replies == nServers {
 					message.Texto = "Oi"
 					message.TypeMessage = CSREQUEST
+					fmt.Println("Entrei na CS")
 					go doClientJob(CSconn, message)
 					replies = 1 //comecei do 1 e nao do zero, para nao precisar fazer subtracao no if's
+					state = HELD
 				}
 				numReplies <- replies
-				state = HELD
 				break
 
 			}
 			stateProcess <- state
 			break
 		case CSREPLY:
+			fmt.Println("Mensagem eh CS retornou")
 			<-stateProcess
 			stateProcess <- RELEASED
 			//Libera CS e devolve para os outros processos que desejam o CS
@@ -158,8 +195,11 @@ func doServerJob() {
 			message.TypeMessage = REPLY
 			message.Clock = T
 			for i := 0; i < nRequestMessages; i++ {
+				fmt.Println("Manda reply para o processo ", requestProcessesInfoAux[i].Id)
 				go doClientJob(CliConn[requestProcessesInfoAux[i].Id-1], message)
 			}
+			<-requestTimeStamp
+			requestTimeStamp <- processInfoAux.Clock
 			requestProcessesInfoAux = nil
 			requestProcessesInfo <- requestProcessesInfoAux
 			break
@@ -168,7 +208,6 @@ func doServerJob() {
 
 		//processInfoAux.Clock++
 		fmt.Printf("Logical Clock: %d\n", processInfoAux.Clock)
-		processInfo <- processInfoAux
 		//stateProcess <- stateProcessAux
 	}
 	//Loop infinito
@@ -180,13 +219,16 @@ func doServerJob() {
 func doClientJob(conn *net.UDPConn, message processStruct) {
 	//Enviar uma mensagem (com valor i) para o servidor do processo
 	//otherServer
+	//fmt.Println("Flag01")
+	incClock(0)
 	buf, err := json.Marshal(message)
 	CheckError(err)
+	fmt.Println(string(buf), err)
 	_, err = conn.Write(buf)
 	if err != nil {
 		fmt.Println(string(buf), err)
 	}
-	time.Sleep(time.Second * 1)
+	//time.Sleep(time.Second * 1)
 }
 
 func initConnections() {
@@ -199,9 +241,11 @@ func initConnections() {
 	// fmt.Println("Flag01")
 	// fmt.Println("Server: ", "127.0.0.1"+myPort)
 	//Outros códigos para deixar ok a conexão do meu servidor (onde recebo msgs). O processo já deve ficar habilitado a receber msgs.
-	ServerAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1"+myPort)
+	myAddressString := "127.0.0.1" + myPort
+	ServerAddr, err := net.ResolveUDPAddr("udp", myAddressString)
 	CheckError(err)
-	clockAux := processStruct{Id: id, Clock: 0, Texto: ""}
+	clockAux := processStruct{Id: id, Clock: 0, Address: myAddressString, Texto: ""}
+	fmt.Println("Address ", clockAux.Address)
 	ServConn, err = net.ListenUDP("udp", ServerAddr)
 	CheckError(err)
 	LocalAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
@@ -220,7 +264,7 @@ func initConnections() {
 
 	}
 
-	CliAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:1001")
+	CliAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:10001")
 	CheckError(err)
 	CSconn, err = net.DialUDP("udp", LocalAddr, CliAddr)
 	CheckError(err)
@@ -230,6 +274,7 @@ func initConnections() {
 	requestProcessesInfoAux := make([]processStruct, 0)
 	requestProcessesInfo <- requestProcessesInfoAux
 	numReplies <- 1 //comecei do 1 e nao do zero, para nao precisar fazer subtracao no if's
+	requestTimeStamp <- 0
 	// nServers--
 }
 
@@ -248,6 +293,7 @@ func readInput(ch chan string) {
 
 func main() {
 	var processInfoAux processStruct
+	//var message processStruct
 	processInfo = make(chan processStruct, 1)
 	stateProcess = make(chan stateType, 1)
 	requestProcessesInfo = make(chan []processStruct, 1)
@@ -284,24 +330,29 @@ func main() {
 						break
 					case RELEASED:
 						stateProcess <- WANTED
-						<-requestTimeStamp
+						fmt.Println("Processo foi de RELEASED para WANTED")
+
 						processInfoAux = <-processInfo
-						requestTimeStamp <- processInfoAux.Clock
 						processInfo <- processInfoAux
-						//Envia para os outros, um request
+						T := processInfoAux.Clock
+						<-requestTimeStamp
+						requestTimeStamp <- processInfoAux.Clock
+						//Espera 5 segundos para começar os pedidos
+						fmt.Println("Espera 5 segundos para mandar requests")
+						time.Sleep(time.Second * 5)
+						fmt.Println("O agent faz os requests para pedir o direito ao CS")
+						fmt.Println("T =", T, " para o processo ", id)
+						processInfoAux.TypeMessage = REQUEST
 						for i := 1; i < id; i++ {
-							processInfoAux = <-processInfo
-							processInfoAux.TypeMessage = REQUEST
-							go doClientJob(CliConn[i], processInfoAux)
-							processInfo <- processInfoAux
+							//processInfoAux.TypeMessage = REQUEST
+							go doClientJob(CliConn[i-1], processInfoAux)
 						}
 						// Eu escolhi ter dois for's do que ter if's no dentro de todos os loops
 						for i := id + 1; i <= nServers; i++ {
-							processInfoAux = <-processInfo
-							processInfoAux.TypeMessage = REQUEST
-							go doClientJob(CliConn[i], processInfoAux)
-							processInfo <- processInfoAux
+							//processInfoAux.TypeMessage = REQUEST
+							go doClientJob(CliConn[i-1], processInfoAux)
 						}
+						//processInfo <- processInfoAux
 						break
 					case HELD:
 						fmt.Print("x ignorado")
@@ -312,15 +363,17 @@ func main() {
 				} else {
 					idEnviar, erro := strconv.Atoi(x)
 					CheckError(erro)
-					processInfoAux = <-processInfo
-					processInfoAux.Clock++
+					//processInfoAux = <-processInfo
+					//processInfoAux.Clock++
 					if id == idEnviar {
 						// go doClientJob(id-1, id)
-						fmt.Printf("Logical Clock: %d\n", processInfoAux.Clock)
+						//fmt.Printf("Logical Clock: %d\n", processInfoAux.Clock)
+						incClock(0)
 					} else {
-						fmt.Println("id invalido")
+
+						fmt.Println("id nao corresponde ao do processo")
 					}
-					processInfo <- processInfoAux
+					//processInfo <- processInfoAux
 				}
 
 			} else {
